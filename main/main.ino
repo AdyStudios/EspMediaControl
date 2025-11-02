@@ -13,6 +13,21 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 volatile uint32_t lastIsrTime = 0;
 int upOrDown = 0;
 
+unsigned long lastProgressUpdate = 0;
+long lastKnownPos = 0;
+long lastKnownLen = 0;
+bool lastIsPlaying = false;
+
+bool scrollEnabled = false;
+int16_t scrollX = 0;
+int16_t scrollStartX = 0;
+int16_t scrollEndX = 0;
+unsigned int scrollLastMs = 0;
+uint16_t scrollDelayMs = 20;
+int16_t titleTextWidth = 0;
+String currentTitle = "";
+String currentArtist = "";
+
 const unsigned char PROGMEM play_icon[] = {
   0b00011000,
   0b00011100,
@@ -24,7 +39,6 @@ const unsigned char PROGMEM play_icon[] = {
   0b00011000
 };
 
-// 8x8 Pause icon (two vertical bars)
 const unsigned char PROGMEM pause_icon[] = {
   0b01100110,
   0b01100110,
@@ -48,20 +62,87 @@ void IRAM_ATTR handleA() {
   uint32_t now = micros();
   if (now - lastIsrTime < 2000) return;
   lastIsrTime = now;
-
   bool a = digitalRead(PIN_A);
   bool b = digitalRead(PIN_B);
+  if (a == b) upOrDown = 1;
+  else upOrDown = -1;
+}
 
-  if (a == b) {
-    upOrDown = 1;   
-  } else {
-    upOrDown = -1;   
+void UpdateProgress() {
+  if (!lastIsPlaying) return;  // don’t update if paused
+
+  unsigned long now = millis();
+  unsigned long elapsed = now - lastProgressUpdate;
+  if (elapsed < 5000) return;
+
+  lastKnownPos += elapsed;
+  if (lastKnownPos > lastKnownLen)
+    lastKnownPos = lastKnownLen;
+
+  lastProgressUpdate = now;
+
+  int pos_s = lastKnownPos / 1000;
+  int len_s = lastKnownLen / 1000;
+  uint8_t pos_m = pos_s / 60;
+  uint8_t pos_sec = pos_s % 60;
+  uint8_t len_m = len_s / 60;
+  uint8_t len_sec = len_s % 60;
+
+  display.fillRect(0, SCREEN_HEIGHT - 2, SCREEN_WIDTH-10, 3, SSD1306_BLACK);  //-10 so that the play icon has space
+  int barWidth = map(lastKnownPos, 0, lastKnownLen, 0, SCREEN_WIDTH-10); //-10 so that the play icon has space
+  display.fillRect(0, SCREEN_HEIGHT-2, barWidth, 3, SSD1306_WHITE);
+
+  //display.setTextSize(1);
+  //display.setTextColor(SSD1306_WHITE);
+  //display.setCursor(0, SCREEN_HEIGHT - 8);
+  //char timeStr[20];
+  //sprintf(timeStr, "%d:%02d / %d:%02d", pos_m, pos_sec, len_m, len_sec);
+  //display.println(timeStr);
+  display.display();
+}
+
+void updateTitleScroll() {
+  if (!scrollEnabled) return;
+
+  unsigned long now = millis();
+  if (now - scrollLastMs < scrollDelayMs) return;
+  scrollLastMs = now;
+
+  scrollX -= 1;
+  if (scrollX <= scrollEndX) {
+    static unsigned long pauseUntil = 0;
+    if (pauseUntil == 0) {
+      pauseUntil = now + 100; //pause at end
+      return;
+    } else if (now < pauseUntil) {
+      return;
+    } else {
+      // wrap
+      pauseUntil = 0;
+      scrollX = scrollStartX;
+    }
   }
+
+  int titleBandY = 0;
+  int titleBandH = 24;
+
+  display.fillRect(0, titleBandY, SCREEN_WIDTH, titleBandH, SSD1306_BLACK);
+
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(scrollX, 0);
+  display.print(currentTitle);
+
+  display.setTextSize(1);
+  display.setCursor(0, 20);  // was 16
+  display.print(currentArtist);
+
+  display.display();
 }
 
 void showMessage(const String& line1, const String& line2 = "") {
   display.clearDisplay();
-  display.setTextSize(1);
+  display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   display.println(line1);
@@ -70,18 +151,42 @@ void showMessage(const String& line1, const String& line2 = "") {
   display.display();
 }
 
-void showMetadata(const String& title, const String& artist, const bool isPlaying) {
+void showMetadata(const String& title, const String& artist, const bool isPlaying, const String position, const String lenght) {
   display.clearDisplay();
-  if(isPlaying) display.drawBitmap(SCREEN_WIDTH - 8, 0, play_icon, 8, 8, SSD1306_WHITE);
-  else display.drawBitmap(SCREEN_WIDTH - 8, 0, pause_icon, 8, 8, SSD1306_WHITE);
+
+  if (isPlaying) display.drawBitmap(SCREEN_WIDTH - 8, SCREEN_HEIGHT - 8, play_icon, 8, 8, SSD1306_WHITE);
+  else display.drawBitmap(SCREEN_WIDTH - 8, SCREEN_HEIGHT - 8, pause_icon, 8, 8, SSD1306_WHITE);
+
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println(title.substring(0, 21));  // truncate to fit width
-  display.setCursor(0, 16);
-  display.setTextSize(1);
-  display.println(artist.substring(0, 21));
-  display.display();
+  display.setTextWrap(false);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
+  
+  titleTextWidth = w;
+  currentTitle = title;
+  currentArtist = artist;
+
+  if (titleTextWidth > SCREEN_WIDTH) {
+    // enable software scroll
+    
+    scrollEnabled = true;
+    scrollStartX = SCREEN_WIDTH;        // start drawing just off the right edge
+    scrollEndX = -titleTextWidth;      // stop when text has fully scrolled left
+    scrollX = scrollStartX;
+    scrollLastMs = millis();
+  } else {
+    scrollEnabled = false;
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.println(currentTitle);
+
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.println(currentArtist);
+    display.display();
+  }
 }
 
 void loadingAnimation() {
@@ -103,7 +208,13 @@ void loadingAnimation() {
   display.setCursor(10, 10);
   display.println("TOYOTA");
   display.display();
-  delay(2000);
+  delay(500);
+  display.clearDisplay();
+  delay(500);
+  display.setCursor(0,0);
+  display.println("KARA");
+  display.display();
+  delay(1000);
 }
 
 class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
@@ -121,13 +232,19 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
 static void notifyCallback(BLERemoteCharacteristic* chr, uint8_t* data, size_t len, bool isNotify) {
   String s = "";
   for (size_t i = 0; i < len; i++) s += (char)data[i];
-  Serial.printf("[BLE] Notification: %s\n", s.c_str());
   int sep = s.indexOf('.');
+  int sep2 = s.indexOf(';');
+  int sep3 = s.indexOf('|');
+  int sep4 = s.indexOf('/');
+  lastProgressUpdate = millis();
   bool isPlaying = false;
-  String condition = "1";
+  lastProgressUpdate = millis();
   if (sep > 0) {
-    if(s.substring(s.length()-2, s.length()-1) == "1") isPlaying = true;
-    showMetadata(s.substring(0, sep), s.substring(sep + 1, s.length()-3), isPlaying);
+    if(s.substring(sep2+1, sep3) == "1") isPlaying = true;
+    lastKnownPos = s.substring(sep3 + 1, sep4).toInt();
+    lastKnownLen = s.substring(sep4 + 1).toInt();
+    lastIsPlaying = isPlaying;
+    showMetadata(s.substring(0, sep), s.substring(sep + 1, sep2), isPlaying, s.substring(sep3+1,sep4), s.substring(sep4+1));
   } else {
     //showMetadata(s, "No music.", false);
   }
@@ -159,13 +276,19 @@ bool connectToPhone() {
     BLERemoteCharacteristic* metaChar = pSvc->getCharacteristic(metaCharUUID);
     if (metaChar && metaChar->canRead()) {
         auto rawVal = metaChar->readValue();
-        String val = String(rawVal.c_str()); 
-        Serial.printf("Initial metadata: %s\n", val.c_str());
-        int sep = val.indexOf('.');
-        if (sep != -1)
-            showMetadata(val.substring(0, sep), val.substring(sep + 1), true);
-        else
-            showMetadata(val, "", true);
+        String s = String(rawVal.c_str()); 
+        Serial.printf("Initial metadata: %s\n", s.c_str());
+        int sep = s.indexOf('.');
+        int sep2 = s.indexOf(';');
+        int sep3 = s.indexOf('|');
+        int sep4 = s.indexOf('/');
+        bool isPlaying = false;
+        if (sep > 0) {
+          if(s.substring(sep2+1, sep3) == "1") isPlaying = true;
+          showMetadata(s.substring(0, sep), s.substring(sep + 1, sep2), isPlaying, s.substring(sep3+1,sep4), s.substring(sep4+1));
+        } else {
+          //showMetadata(s, "No music.", false);
+        }
     }
     if (metaChar && metaChar->canNotify()) {
         metaChar->registerForNotify(notifyCallback);
@@ -181,7 +304,7 @@ void sendCommand(String cmd) {
             if (cmdChar && cmdChar->canWrite()) {
                 bool success = cmdChar->writeValue(cmd);
                 if (success) {
-                    Serial.println("[BLE] Sent 'volup' command!");
+                    Serial.printf("[BLE] Sent %d command!\n", cmd);
                 } else {
                     Serial.println("[BLE] Failed to send command.");
                 }
@@ -220,26 +343,28 @@ void setup() {
 }
 
 void loop() {
+    if(client && !client->isConnected()) return;
     if (doConnect) {
         doConnect = false;
         connectToPhone();
     }
-    upOrDown = 0;
+    
     noInterrupts();
     interrupts();
     if(upOrDown == 1)
     {
-      Serial.println("Sending Volume Up Command...");
-      sendCommand("volup"); // Volume Up
+      sendCommand("volup");
       upOrDown = 0;
     }
 
     if(upOrDown == -1)
     {
-      Serial.println("Sending Volume Down Command...");
-      sendCommand("voldown"); // Volume Down
+      sendCommand("voldown");
       upOrDown = 0;
     }
 
-    delay(100);
+    updateTitleScroll();
+    UpdateProgress();
+
+    delay(5);
 }
